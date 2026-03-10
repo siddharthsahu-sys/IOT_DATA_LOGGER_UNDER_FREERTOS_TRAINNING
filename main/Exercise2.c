@@ -46,6 +46,11 @@ typedef struct __attribute__((packed)) {
 // --- Global Variables ---
 DeviceConfig_t global_cfg;
 QueueHandle_t mqtt_queue;
+typedef struct{
+    uint8_t arry[MQTT_PACKET_SIZE];
+    uint16_t packetLen;
+}Mqtt_Queue;
+
 esp_mqtt_client_handle_t client_global = NULL;
 char base_topic[64], config_topic[64];
 
@@ -59,33 +64,46 @@ void hex_string_to_bytes(const char* src, uint8_t* dst, int byte_len) {
 // --- UART Sampler Task (Core 0) ---
 void uart_sampler_task(void *pvParameters) {
     uint8_t rx_temp[MAX_QUERY_LEN];
-    uint8_t tx_buffer[MQTT_PACKET_SIZE];
-
+    // uint8_t tx_buffer[MQTT_PACKET_SIZE];
+    Mqtt_Queue st_Mqtt_Queue;
     while (1) {
-        memset(tx_buffer, 0, MQTT_PACKET_SIZE); 
+        memset(&st_Mqtt_Queue, 0, sizeof(Mqtt_Queue)); 
         int pos = 0;
 
         if (global_cfg.is_query_based) {
             for (int i = 0; i < global_cfg.num_queries; i++) {
                 uart_write_bytes(UART_PORT_NUM, (const char*)global_cfg.queries[i], global_cfg.query_lengths[i]);
                 int len = uart_read_bytes(UART_PORT_NUM, rx_temp, MAX_QUERY_LEN, pdMS_TO_TICKS(100));
-                
+
                 if (pos < MQTT_PACKET_SIZE - 2) {
-                    tx_buffer[pos++] = '~';
+                    st_Mqtt_Queue.arry[pos++] = '~';
                     if (len > 0) {
-                        memcpy(&tx_buffer[pos], rx_temp, len);
+                        memcpy(&st_Mqtt_Queue.arry[pos], rx_temp, len);
                         pos += len;
                     }
-                    tx_buffer[pos++] = '#';
+                    st_Mqtt_Queue.arry[pos++] = '#';
                 }
-                vTaskDelay(pdMS_TO_TICKS(1000)); 
+                // vTaskDelay(pdMS_TO_TICKS(1000)); 
             }
+        st_Mqtt_Queue.packetLen=pos;
         } else {
-            int len = uart_read_bytes(UART_PORT_NUM, rx_temp, MAX_QUERY_LEN, pdMS_TO_TICKS(200));
-            if (len > 0) snprintf((char*)tx_buffer, MQTT_PACKET_SIZE, "~%.*s#", len, rx_temp);
+            int len = uart_read_bytes(UART_PORT_NUM, rx_temp, MQTT_PACKET_SIZE - 2, pdMS_TO_TICKS(200));
+            if (len > 0) {
+                st_Mqtt_Queue.arry[0] = '~';
+                memcpy(&st_Mqtt_Queue.arry[1], rx_temp, len);
+                st_Mqtt_Queue.arry[len + 1] = '#';
+                st_Mqtt_Queue.packetLen = len + 2;
+            } else {
+                st_Mqtt_Queue.arry[0] = '~';
+                st_Mqtt_Queue.arry[1] = '#';
+                st_Mqtt_Queue.packetLen = 2;
+            }
         }
 
-        xQueueSend(mqtt_queue, tx_buffer, 0);
+        // Send pointer to the queue item
+        if (st_Mqtt_Queue.packetLen > 0) {
+            xQueueSend(mqtt_queue, &st_Mqtt_Queue, portMAX_DELAY);
+        }
         vTaskDelay(pdMS_TO_TICKS(global_cfg.publish_freq * 1000));
     }
 }
@@ -146,9 +164,12 @@ void app_main(void) {
     if (nvs_get_blob(h, "device_cfg", &global_cfg, &size) != ESP_OK) {
         global_cfg.publish_freq = 10;
         global_cfg.is_query_based = 1;
-        global_cfg.num_queries = 1;
+        global_cfg.num_queries = 2;
         global_cfg.query_lengths[0] = 4;
         memcpy(global_cfg.queries[0], "\x01\x02\x03\xFF", 4);
+        global_cfg.query_lengths[1] = 4;
+        memcpy(global_cfg.queries[1], "\x02\x02\x03\xFF", 4);
+
     }
     nvs_close(h);
 
@@ -163,34 +184,28 @@ void app_main(void) {
     uart_set_pin(UART_PORT_NUM, UART_TX_PIN, UART_RX_PIN, -1, -1);
     uart_driver_install(UART_PORT_NUM, 1024, 0, 0, NULL, 0);
 
-    // 4. Queue & Sampling Task (Core 0)
-    mqtt_queue = xQueueCreate(15, MQTT_PACKET_SIZE);
-    xTaskCreatePinnedToCore(uart_sampler_task, "uart_task", 4096, NULL, 10, NULL, 0);
+    // 4. Queue & Sampling Task (Core 1)
+    mqtt_queue = xQueueCreate(5,sizeof(Mqtt_Queue));
+    xTaskCreatePinnedToCore(uart_sampler_task, "uart_task", 4096, NULL, 10, NULL, 1);               // Core one configured
 
-    // 5. Connection & MQTT (Core 1)
+    // 5. Connection & MQTT (Core 0) config from sdkconfig
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     ESP_ERROR_CHECK(example_connect());
     mqtt_app_start();
 
-    // 6. Publishing Loop (Core 1)
-    uint8_t out_data[MQTT_PACKET_SIZE];
+    // 6. Publishing Loop (Core 1) config from sdkconfig
+    // uint8_t out_data[MQTT_PACKET_SIZE];
+    Mqtt_Queue received_queue;
+    
     while (1) {
-        if (xQueueReceive(mqtt_queue, out_data, portMAX_DELAY)) {
-            if (client_global) {
-                esp_mqtt_client_publish(client_global, base_topic, (char*)out_data, MQTT_PACKET_SIZE, 1, 0);
+        // Receive pointer to the queue item
+        if (xQueueReceive(mqtt_queue, &received_queue, portMAX_DELAY)) {
+            if (client_global && received_queue.packetLen > 0) {
+                esp_mqtt_client_publish(client_global, base_topic, (char*)received_queue.arry, received_queue.packetLen, 1, 0);
+                ESP_LOGI(TAG, "Published: %.*s", received_queue.packetLen, (char*)received_queue.arry);
             }
         }
     }
 }
 
-// ```
-
-// ### How it works:
-
-// 1. **Macro Usage:** It uses your `DEFAULT_MQTTURL`, `USERNAME`, and `PASSWORD`.
-// 2. **Sample Integrity:** The UART logic on Core 0 is isolated from the WiFi stack. Even if WiFi blocks for 200ms during a burst, Core 0 continues to query the UART and pushes data into the 15-slot queue.
-// 3. **Dynamic Topics:** It automatically detects the MAC address to subscribe to `Config/MAC` and publish to `ESP32toCloud/MAC`.
-// 4. **Raw Hex Update:** When you send a hex string to the config topic, it converts it, saves it to NVS, and reboots the ESP32 to apply the new sampling parameters.
-
-// **Would you like me to explain the exact memory map of the `DeviceConfig_t` struct so you can prepare your hex string correctly?**
