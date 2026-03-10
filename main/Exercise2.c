@@ -1,169 +1,196 @@
+
 #include <stdio.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
 #include "esp_system.h"
-#include "esp_partition.h"
 #include "nvs_flash.h"
 #include "esp_event.h"
 #include "esp_netif.h"
-#include "protocol_examples_common.h"
-
 #include "esp_log.h"
 #include "mqtt_client.h"
-#include "esp_tls.h"
-#include "esp_ota_ops.h"
-#include <sys/param.h>
-
+#include "esp_mac.h"
+#include "driver/uart.h"
+#include "protocol_examples_common.h" // For example_connect()
+#include "macros.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 
-#include <stdio.h>
-#include <stdlib.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "esp_log.h"
 
-static const char *TAG = "mqtts_example";
+#define MAX_QUERIES 10
+#define MAX_QUERY_LEN 20
+#define MQTT_PACKET_SIZE 500
+#define UART_PORT_NUM UART_NUM_1
+#define UART_TX_PIN 17
+#define UART_RX_PIN 16
 
+static const char *TAG = "IOT_LOGGER";
+
+// --- Certificate Handling ---
 #if CONFIG_BROKER_CERTIFICATE_OVERRIDDEN == 1
-static const uint8_t mqtt_eclipseprojects_io_pem_start[]  = "-----BEGIN CERTIFICATE-----\n" CONFIG_BROKER_CERTIFICATE_OVERRIDE "\n-----END CERTIFICATE-----";
+static const uint8_t mqtt_pem_start[] = "-----BEGIN CERTIFICATE-----\n" CONFIG_BROKER_CERTIFICATE_OVERRIDE "\n-----END CERTIFICATE-----";
 #else
-extern const uint8_t mqtt_eclipseprojects_io_pem_start[]   asm("_binary_mqtt_eclipseprojects_io_pem_start");
+extern const uint8_t mqtt_pem_start[] asm("_binary_mqtt_eclipseprojects_io_pem_start");
 #endif
-extern const uint8_t mqtt_eclipseprojects_io_pem_end[]   asm("_binary_mqtt_eclipseprojects_io_pem_end");
 
-//
-// Note: this function is for testing purposes only publishing part of the active partition
-//       (to be checked against the original binary)
-//
-static void send_binary(esp_mqtt_client_handle_t client)
-{
-    esp_partition_mmap_handle_t out_handle;
-    const void *binary_address;
-    const esp_partition_t *partition = esp_ota_get_running_partition();
-    esp_partition_mmap(partition, 0, partition->size, ESP_PARTITION_MMAP_DATA, &binary_address, &out_handle);
-    // sending only the configured portion of the partition (if it's less than the partition size)
-    int binary_size = MIN(CONFIG_BROKER_BIN_SIZE_TO_SEND, partition->size);
-    int msg_id = esp_mqtt_client_publish(client, "/topic/binary", binary_address, binary_size, 0, 0);
-    ESP_LOGI(TAG, "binary sent with msg_id=%d", msg_id);
-}
+// --- Configuration Struct ---
+typedef struct __attribute__((packed)) {
+    uint32_t publish_freq;      
+    uint8_t is_query_based;     
+    uint8_t num_queries;        
+    uint8_t query_lengths[MAX_QUERIES];
+    uint8_t queries[MAX_QUERIES][MAX_QUERY_LEN];
+} DeviceConfig_t;
 
-/*
- * @brief Event handler registered to receive MQTT events
- *
- *  This function is called by the MQTT client event loop.
- *
- * @param handler_args user data registered to the event.
- * @param base Event base for the handler(always MQTT Base in this example).
- * @param event_id The id for the received event.
- * @param event_data The data for the event, esp_mqtt_event_handle_t.
- */
-static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
-{
-    ESP_LOGD(TAG, "Event dispatched from event loop base=%s, event_id=%" PRIi32, base, event_id);
-    esp_mqtt_event_handle_t event = event_data;
-    esp_mqtt_client_handle_t client = event->client;
-    int msg_id;
-    switch ((esp_mqtt_event_id_t)event_id) {
-    case MQTT_EVENT_CONNECTED:
-        ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
-        msg_id = esp_mqtt_client_subscribe(client, "/topic/qos0", 0);
-        ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
+// --- Global Variables ---
+DeviceConfig_t global_cfg;
+QueueHandle_t mqtt_queue;
+esp_mqtt_client_handle_t client_global = NULL;
+char base_topic[64], config_topic[64];
 
-        msg_id = esp_mqtt_client_subscribe(client, "/topic/qos1", 1);
-        ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
-
-        msg_id = esp_mqtt_client_unsubscribe(client, "/topic/qos1");
-        ESP_LOGI(TAG, "sent unsubscribe successful, msg_id=%d", msg_id);
-        break;
-    case MQTT_EVENT_DISCONNECTED:
-        ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
-        break;
-
-    case MQTT_EVENT_SUBSCRIBED:
-        ESP_LOGI(TAG, "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id);
-        msg_id = esp_mqtt_client_publish(client, "/topic/qos0", "data", 0, 0, 0);
-        ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);
-        break;
-    case MQTT_EVENT_UNSUBSCRIBED:
-        ESP_LOGI(TAG, "MQTT_EVENT_UNSUBSCRIBED, msg_id=%d", event->msg_id);
-        break;
-    case MQTT_EVENT_PUBLISHED:
-        ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED, msg_id=%d", event->msg_id);
-        break;
-    case MQTT_EVENT_DATA:
-        ESP_LOGI(TAG, "MQTT_EVENT_DATA");
-        printf("TOPIC=%.*s\r\n", event->topic_len, event->topic);
-        printf("DATA=%.*s\r\n", event->data_len, event->data);
-        if (strncmp(event->data, "send binary please", event->data_len) == 0) {
-            ESP_LOGI(TAG, "Sending the binary");
-            send_binary(client);
-        }
-        break;
-    case MQTT_EVENT_ERROR:
-        ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
-        if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
-            ESP_LOGI(TAG, "Last error code reported from esp-tls: 0x%x", event->error_handle->esp_tls_last_esp_err);
-            ESP_LOGI(TAG, "Last tls stack error number: 0x%x", event->error_handle->esp_tls_stack_err);
-            ESP_LOGI(TAG, "Last captured errno : %d (%s)",  event->error_handle->esp_transport_sock_errno,
-                     strerror(event->error_handle->esp_transport_sock_errno));
-        } else if (event->error_handle->error_type == MQTT_ERROR_TYPE_CONNECTION_REFUSED) {
-            ESP_LOGI(TAG, "Connection refused error: 0x%x", event->error_handle->connect_return_code);
-        } else {
-            ESP_LOGW(TAG, "Unknown error type: 0x%x", event->error_handle->error_type);
-        }
-        break;
-    default:
-        ESP_LOGI(TAG, "Other event id:%d", event->event_id);
-        break;
+// --- Helpers ---
+void hex_string_to_bytes(const char* src, uint8_t* dst, int byte_len) {
+    for (int i = 0; i < byte_len; i++) {
+        sscanf(src + (i * 2), "%02hhx", &dst[i]);
     }
 }
 
-static void mqtt_app_start(void)
-{
+// --- UART Sampler Task (Core 0) ---
+void uart_sampler_task(void *pvParameters) {
+    uint8_t rx_temp[MAX_QUERY_LEN];
+    uint8_t tx_buffer[MQTT_PACKET_SIZE];
+
+    while (1) {
+        memset(tx_buffer, 0, MQTT_PACKET_SIZE); 
+        int pos = 0;
+
+        if (global_cfg.is_query_based) {
+            for (int i = 0; i < global_cfg.num_queries; i++) {
+                uart_write_bytes(UART_PORT_NUM, (const char*)global_cfg.queries[i], global_cfg.query_lengths[i]);
+                int len = uart_read_bytes(UART_PORT_NUM, rx_temp, MAX_QUERY_LEN, pdMS_TO_TICKS(100));
+                
+                if (pos < MQTT_PACKET_SIZE - 2) {
+                    tx_buffer[pos++] = '~';
+                    if (len > 0) {
+                        memcpy(&tx_buffer[pos], rx_temp, len);
+                        pos += len;
+                    }
+                    tx_buffer[pos++] = '#';
+                }
+                vTaskDelay(pdMS_TO_TICKS(1000)); 
+            }
+        } else {
+            int len = uart_read_bytes(UART_PORT_NUM, rx_temp, MAX_QUERY_LEN, pdMS_TO_TICKS(200));
+            if (len > 0) snprintf((char*)tx_buffer, MQTT_PACKET_SIZE, "~%.*s#", len, rx_temp);
+        }
+
+        xQueueSend(mqtt_queue, tx_buffer, 0);
+        vTaskDelay(pdMS_TO_TICKS(global_cfg.publish_freq * 1000));
+    }
+}
+
+// --- MQTT Event Handler ---
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
+    esp_mqtt_event_handle_t event = event_data;
+    switch ((esp_mqtt_event_id_t)event_id) {
+        case MQTT_EVENT_CONNECTED:
+            esp_mqtt_client_subscribe(event->client, config_topic, 1);
+            ESP_LOGI(TAG, "Subscribed to config: %s", config_topic);
+            break;
+        case MQTT_EVENT_DATA:
+            if (strncmp(event->topic, config_topic, event->topic_len) == 0) {
+                if (event->data_len == sizeof(DeviceConfig_t) * 2) {
+                    hex_string_to_bytes(event->data, (uint8_t*)&global_cfg, sizeof(DeviceConfig_t));
+                    nvs_handle_t h;
+                    nvs_open("storage", NVS_READWRITE, &h);
+                    nvs_set_blob(h, "device_cfg", &global_cfg, sizeof(DeviceConfig_t));
+                    nvs_commit(h);
+                    nvs_close(h);
+                    esp_mqtt_client_publish(event->client, config_topic, "SUCCESS", 7, 1, 0);
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                    esp_restart();
+                } else {
+                    esp_mqtt_client_publish(event->client, config_topic, "FAIL_LEN", 8, 1, 0);
+                }
+            }
+            break;
+        default: break;
+    }
+}
+
+static void mqtt_app_start(void) {
     const esp_mqtt_client_config_t mqtt_cfg = {
         .broker = {
-            // .address.uri = CONFIG_BROKER_URI,
             .address.uri = DEFAULT_MQTTURL,
-            .verification.certificate = (const char *)mqtt_eclipseprojects_io_pem_start
+            .verification.certificate = (const char *)mqtt_pem_start
         },
         .credentials = {
             .username = DEFAULT_USERNAME,
             .authentication.password = DEFAULT_PASSWORD
         }
     };
-
-    ESP_LOGI(TAG, "[APP] Free memory: %" PRIu32 " bytes", esp_get_free_heap_size());
-    esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
-    /* The last argument may be used to pass data to the event handler, in this example mqtt_event_handler */
-    esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
-    esp_mqtt_client_start(client);
+    client_global = esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_register_event(client_global, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_start(client_global);
 }
 
-void app_main(void)
-{
-    ESP_LOGI(TAG, "[APP] Startup..");
-    ESP_LOGI(TAG, "[APP] Free memory: %" PRIu32 " bytes", esp_get_free_heap_size());
-    ESP_LOGI(TAG, "[APP] IDF version: %s", esp_get_idf_version());
-
-    esp_log_level_set("*", ESP_LOG_INFO);
-    esp_log_level_set("esp-tls", ESP_LOG_VERBOSE);
-    esp_log_level_set("mqtt_client", ESP_LOG_VERBOSE);
-    esp_log_level_set("mqtt_example", ESP_LOG_VERBOSE);
-    esp_log_level_set("transport_base", ESP_LOG_VERBOSE);
-    esp_log_level_set("transport", ESP_LOG_VERBOSE);
-    esp_log_level_set("outbox", ESP_LOG_VERBOSE);
-
+void app_main(void) {
+    // 1. Storage
     ESP_ERROR_CHECK(nvs_flash_init());
+
+    // 2. Load Config
+    nvs_handle_t h;
+    nvs_open("storage", NVS_READWRITE, &h);
+    size_t size = sizeof(DeviceConfig_t);
+    if (nvs_get_blob(h, "device_cfg", &global_cfg, &size) != ESP_OK) {
+        global_cfg.publish_freq = 10;
+        global_cfg.is_query_based = 1;
+        global_cfg.num_queries = 1;
+        global_cfg.query_lengths[0] = 4;
+        memcpy(global_cfg.queries[0], "\x01\x02\x03\xFF", 4);
+    }
+    nvs_close(h);
+
+    // 3. Setup Identity & UART
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    sprintf(base_topic, "ESP32toCloud/%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    sprintf(config_topic, "Config/%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+    uart_config_t u_cfg = { .baud_rate = 9600, .data_bits = UART_DATA_8_BITS, .parity = UART_PARITY_DISABLE, .stop_bits = UART_STOP_BITS_1, .flow_ctrl = UART_HW_FLOWCTRL_DISABLE, .source_clk = UART_SCLK_DEFAULT };
+    uart_param_config(UART_PORT_NUM, &u_cfg);
+    uart_set_pin(UART_PORT_NUM, UART_TX_PIN, UART_RX_PIN, -1, -1);
+    uart_driver_install(UART_PORT_NUM, 1024, 0, 0, NULL, 0);
+
+    // 4. Queue & Sampling Task (Core 0)
+    mqtt_queue = xQueueCreate(15, MQTT_PACKET_SIZE);
+    xTaskCreatePinnedToCore(uart_sampler_task, "uart_task", 4096, NULL, 10, NULL, 0);
+
+    // 5. Connection & MQTT (Core 1)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-
-    /* This helper function configures Wi-Fi or Ethernet, as selected in menuconfig.
-     * Read "Establishing Wi-Fi or Ethernet Connection" section in
-     * examples/protocols/README.md for more information about this function.
-     */
     ESP_ERROR_CHECK(example_connect());
-
     mqtt_app_start();
+
+    // 6. Publishing Loop (Core 1)
+    uint8_t out_data[MQTT_PACKET_SIZE];
+    while (1) {
+        if (xQueueReceive(mqtt_queue, out_data, portMAX_DELAY)) {
+            if (client_global) {
+                esp_mqtt_client_publish(client_global, base_topic, (char*)out_data, MQTT_PACKET_SIZE, 1, 0);
+            }
+        }
+    }
 }
+
+// ```
+
+// ### How it works:
+
+// 1. **Macro Usage:** It uses your `DEFAULT_MQTTURL`, `USERNAME`, and `PASSWORD`.
+// 2. **Sample Integrity:** The UART logic on Core 0 is isolated from the WiFi stack. Even if WiFi blocks for 200ms during a burst, Core 0 continues to query the UART and pushes data into the 15-slot queue.
+// 3. **Dynamic Topics:** It automatically detects the MAC address to subscribe to `Config/MAC` and publish to `ESP32toCloud/MAC`.
+// 4. **Raw Hex Update:** When you send a hex string to the config topic, it converts it, saves it to NVS, and reboots the ESP32 to apply the new sampling parameters.
+
+// **Would you like me to explain the exact memory map of the `DeviceConfig_t` struct so you can prepare your hex string correctly?**

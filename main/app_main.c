@@ -1,6 +1,10 @@
 #include "macros.h"
 #ifdef Exercise2
 #include "Exercise2.c"
+
+
+
+
 #elif defined Exercise1
 #include "Exercise1.c"
 #else
