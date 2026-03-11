@@ -14,7 +14,7 @@
   "clangd.arguments": [
     "--background-index",
     "--query-driver=**",
-    "--compile-commands-dir=/home/siddharths/Documents/Trainning/Assignment_10_PerformanceAndCapstone/build"
+    "--compile-commands-dir=/home/siddharths/Documents/Trainning/Assignment_10_IOTdataLoggerPerformanceAndCapstone/build"
   ],
   "idf.flashType": "UART"
 }

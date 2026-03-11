@@ -1,71 +1,282 @@
-| Supported Targets | ESP32 | ESP32-C2 | ESP32-C3 | ESP32-C5 | ESP32-C6 | ESP32-C61 | ESP32-H2 | ESP32-P4 | ESP32-S2 | ESP32-S3 |
-| ----------------- | ----- | -------- | -------- | -------- | -------- | --------- | -------- | -------- | -------- | -------- |
+IoT Data Logger with MQTT Configuration
+Overview
+This IoT Data Logger is an ESP32-based solution that collects sensor data via UART, publishes it to an MQTT broker, and supports remote configuration updates. The system is designed for industrial monitoring applications where sensors communicate over serial interfaces and data needs to be reliably transmitted to cloud platforms.
 
-# ESP-MQTT SSL Sample application
+Key Features
+1. Dual-Mode Data Collection
+Query-Based Mode: Sends predefined queries to sensors and collects responses
 
-(See the README.md file in the upper level 'examples' directory for more information about examples.)
+Continuous Mode: Continuously reads data from sensors without queries
 
-This example connects to the broker mqtt.eclipseprojects.io using ssl transport and as a demonstration subscribes/unsubscribes and send a message on certain topic.
-(Please note that the public broker is maintained by the community so may not be always available, for details please see this [disclaimer](https://iot.eclipse.org/getting-started/#sandboxes))
+2. Configurable Parameters
+Publish frequency
 
-It uses ESP-MQTT library which implements mqtt client to connect to mqtt broker.
+Number of queries
 
-## How to use example
+Query strings (up to 10 queries, 20 bytes each)
 
-### Hardware Required
+Query-based or continuous operation mode
 
-This example can be executed on any ESP32 board, the only required interface is WiFi and connection to internet.
+3. Remote Configuration via MQTT
+Server can push new configurations to the device
 
-### Configure the project
+Configuration is stored in NVS (Non-Volatile Storage)
 
-* Open the project configuration menu (`idf.py menuconfig`)
-* Configure Wi-Fi or Ethernet under "Example Connection Configuration" menu. See "Establishing Wi-Fi or Ethernet Connection" section in [examples/protocols/README.md](../../README.md) for more details.
+Device auto-restarts after applying new configuration
 
-PEM certificate for this example could be extracted from an openssl `s_client` command connecting to mqtt.eclipseprojects.io.
-In case a host operating system has `openssl` and `sed` packages installed, one could execute the following command to download and save the root certificate to a file (Note for Windows users: Both Linux like environment or Windows native packages may be used).
-```
-echo "" | openssl s_client -showcerts -connect mqtt.eclipseprojects.io:8883 | sed -n "1,/Root/d; /BEGIN/,/END/p" | openssl x509 -outform PEM >mqtt_eclipse_org.pem
-```
-Please note that this is not a general command for downloading a root certificate for an arbitrary host;
-this command works with mqtt.eclipseprojects.io as the site provides root certificate in the chain, which then could be extracted
-with text operation.
+Acknowledgment messages confirm successful configuration updates
 
-### Build and Flash
+4. Robust Data Handling
+Queue-based architecture to handle WiFi connectivity issues
 
-Build the project and flash it to the board, then run monitor tool to view serial output:
+50-element queue buffers data during network interruptions
 
-```
-idf.py -p PORT flash monitor
-```
+Simulated WiFi burst testing to validate queue performance
 
-(To exit the serial monitor, type ``Ctrl-]``.)
+5. Dual-Core Processing
+Core 1: UART sampling and data collection
 
-See the Getting Started Guide for full steps to configure and use ESP-IDF to build projects.
+Core 0: MQTT publishing and network operations
 
-## Example Output
+6. Health Monitoring
+Real-time heap memory monitoring
 
-```
-I (3714) event: sta ip: 192.168.0.139, mask: 255.255.255.0, gw: 192.168.0.2
-I (3714) system_api: Base MAC address is not set, read default base MAC address from BLK0 of EFUSE
-I (3964) MQTT_CLIENT: Sending MQTT CONNECT message, type: 1, id: 0000
-I (4164) MQTTS_EXAMPLE: MQTT_EVENT_CONNECTED
-I (4174) MQTTS_EXAMPLE: sent publish successful, msg_id=41464
-I (4174) MQTTS_EXAMPLE: sent subscribe successful, msg_id=17886
-I (4174) MQTTS_EXAMPLE: sent subscribe successful, msg_id=42970
-I (4184) MQTTS_EXAMPLE: sent unsubscribe successful, msg_id=50241
-I (4314) MQTTS_EXAMPLE: MQTT_EVENT_PUBLISHED, msg_id=41464
-I (4484) MQTTS_EXAMPLE: MQTT_EVENT_SUBSCRIBED, msg_id=17886
-I (4484) MQTTS_EXAMPLE: sent publish successful, msg_id=0
-I (4684) MQTTS_EXAMPLE: MQTT_EVENT_SUBSCRIBED, msg_id=42970
-I (4684) MQTTS_EXAMPLE: sent publish successful, msg_id=0
-I (4884) MQTT_CLIENT: deliver_publish, message_length_read=19, message_length=19
-I (4884) MQTTS_EXAMPLE: MQTT_EVENT_DATA
-TOPIC=/topic/qos0
-DATA=data
-I (5194) MQTT_CLIENT: deliver_publish, message_length_read=19, message_length=19
-I (5194) MQTTS_EXAMPLE: MQTT_EVENT_DATA
-TOPIC=/topic/qos0
-DATA=data
-```
+Task stack usage tracking
 
-# IOT_DATA_LOGGER_UNDER_FREERTOS_TRAINNING
+Queue status reporting
+
+Hardware Requirements
+ESP32 Development Board
+
+UART-compatible sensor(s)
+
+WiFi network access
+
+MQTT broker (e.g., Eclipse Mosquitto, HiveMQ Cloud)
+
+Pin Configuration
+Pin	Function
+GPIO 17	UART TX
+GPIO 16	UART RX
+Software Dependencies
+ESP-IDF v4.4 or later
+
+MQTT client library
+
+Protocol examples common library
+
+Configuration Macros
+The following macros should be defined in macros.h:
+
+c
+#define DEFAULT_MQTTURL      "mqtt://your-broker-url"
+#define DEFAULT_USERNAME     "your-username"
+#define DEFAULT_PASSWORD     "your-password"
+MQTT Topics
+Data Publishing
+Topic Format: ESP32toCloud/[MAC_ADDRESS]
+
+Payload Format:
+
+Query mode: ~[response1]#~[response2]#...
+
+Continuous mode: ~[data]#
+
+Configuration
+Subscribe Topic: Config/[MAC_ADDRESS]
+
+Publish Topic: Config/[MAC_ADDRESS] (for acknowledgments)
+
+Configuration Push from Server
+Overview
+The device supports over-the-air configuration updates via MQTT. This allows remote management of multiple devices without physical access.
+
+Configuration Flow
+text
+Server                      Device
+  |                           |
+  |-- Config Payload (Hex) -->|
+  |                           |-- Parse & Validate
+  |                           |-- Store in NVS
+  |                           |-- Auto-Restart
+  |<-- "SUCCESS" Acknowledge--|
+  |                           |
+  |-- New Config Active ----->|
+Configuration Payload Format
+The configuration is sent as a hexadecimal string representing the binary device_config_t structure:
+
+c
+typedef struct __attribute__((packed)) {
+    uint32_t publish_freq;      // Publishing interval in seconds
+    uint8_t is_query_based;      // 1 = query mode, 0 = continuous
+    uint8_t num_queries;         // Number of queries (0-10)
+    uint8_t query_lengths[10];   // Length of each query
+    uint8_t queries[10][20];      // Query strings
+} device_config_t;
+Example Configuration Push
+Using mosquitto_pub:
+
+bash
+# Convert config to hex and publish
+mosquitto_pub -t "Config/001122334455" -m "010000000a0104010203ff04010203ff"
+Configuration Acknowledgment
+The device responds with:
+
+SUCCESS - Configuration applied successfully
+
+FAIL_LEN - Invalid payload length
+
+Security Considerations
+Certificate Validation: TLS certificate verification is enabled by default
+
+Authentication: MQTT username/password authentication supported
+
+MAC-based Topics: Each device uses its unique MAC address for topics
+
+Queue-Based Architecture
+The system uses a FreeRTOS queue to decouple data collection from network transmission:
+
+text
+UART Sampler → [QUEUE] → MQTT Publisher
+    (Core 1)    (50 items)    (Core 0)
+This architecture ensures:
+
+Data is never lost during network interruptions
+
+Sampler continues collecting even when WiFi is busy
+
+Burst data can be handled efficiently
+
+Building and Flashing
+bash
+# Set target
+idf.py set-target esp32
+
+# Build the project
+idf.py build
+
+# Flash to device
+idf.py -p /dev/ttyUSB0 flash
+
+# Monitor output
+idf.py -p /dev/ttyUSB0 monitor
+Configuration Options
+Menuconfig Settings
+Navigate to idf.py menuconfig and configure:
+
+WiFi Configuration
+
+SSID and password
+
+Connection timeout
+
+MQTT Configuration
+
+Broker URL
+
+Username/password
+
+Keep-alive interval
+
+UART Configuration
+
+Baud rate (default: 9600)
+
+Data bits
+
+Stop bits
+
+Parity
+
+Default Configuration
+If no stored configuration exists, the device uses:
+
+c
+{
+    .publish_freq = 10,           // 10 seconds
+    .is_query_based = 1,           // Query mode
+    .num_queries = 2,              // Two queries
+    .query_lengths = {4, 4},       // 4 bytes each
+    .queries = {
+        {0x01, 0x02, 0x03, 0xFF},  // Query 1
+        {0x02, 0x02, 0x03, 0xFF}   // Query 2
+    }
+}
+Health Monitoring Output
+The system prints periodic health statistics:
+
+text
+--- HEALTH CHECK ---
+Free Heap: 123456 bytes
+Sampler Stack Left: 1024
+MQTT Task Stack Left: 896
+Queue Status: 5/50 items
+--------------------
+Troubleshooting
+Common Issues
+WiFi Connection Failures
+
+Check SSID and password
+
+Verify network availability
+
+Check antenna connection
+
+MQTT Connection Failures
+
+Verify broker URL
+
+Check credentials
+
+Ensure network connectivity
+
+UART Communication Issues
+
+Verify baud rate matching
+
+Check wiring connections
+
+Validate logic levels
+
+Queue Full Warnings
+
+Increase QUEUE_SIZE if persistent
+
+Check network stability
+
+Reduce publish frequency
+
+Performance Metrics
+Maximum Queue Size: 50 messages
+
+Message Size: Up to 500 bytes
+
+Publish Frequency: Configurable (default 10 seconds)
+
+WiFi Burst Simulation: Every 15 messages (4-second delay)
+
+Future Enhancements
+OTA Updates: Add firmware update capability
+
+Multiple UART Ports: Support for multiple sensors
+
+Data Encryption: End-to-end encryption for sensitive data
+
+Time-Series Database: Local data storage with timestamps
+
+Advanced Scheduling: Configurable sampling schedules
+
+License
+This project is based on ESP-IDF examples and is available under the Apache License 2.0.
+
+Support
+For issues and questions:
+
+Check ESP-IDF documentation
+
+Review MQTT broker documentation
+
+Verify hardware connections
+
+Monitor serial output for error messages
+
